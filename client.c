@@ -16,17 +16,19 @@
 #include "list.h"
 
 
-static int ping_initialized = 0;
-struct list_head ping_table;
-static pthread_mutex_t ping_mutex;
+//static int ping_initialized = 0;
+//struct list_head ping_table;
 static pthread_t sendpid, recvpid, checkpid;
-static int fd_count = 0;
+//static int fd_count = 0;
+struct _heartbeat {
+    struct list_head ping_table;
+    int ping_initialized;
+    int fd_count;
+    pthread_mutex_t ping_table_mtx;
+};
 
-//struct heartbeat {
-//    struct list_head ping_table;
-//    int    fd_count;
-//}
-
+typedef struct _heartbeat heartbeat_t;
+heartbeat_t *heartbeat = NULL;
 #define SERVER_IP   "10.30.0.3"
 #define SERVER_PORT 8000
 #define CLIENT_IP   "10.30.0.12"
@@ -50,7 +52,6 @@ struct ping_data {
     struct sockaddr_in src;
     struct sockaddr_in dst;
     int              value;
-
 };
 #pragma pack()
 
@@ -96,16 +97,17 @@ void *send_udp_packet(void *data)
     int send_flag = 0;
     unsigned int elapse_time_us = 0;
 
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    pthread_mutex_init(&mutex, NULL);
-    pthread_cond_init(&cond, NULL);
+    if (heartbeat == NULL) {
+        printf("heart beat is null!\n");
+        return NULL;
+    }
 
     while(1) {
-
-        if(!list_empty(&ping_table)){
+        if(!list_empty(&heartbeat->ping_table)){
             struct ping_entry *entry = NULL;
-            list_for_each_entry (entry, &ping_table, list)
+            struct ping_entry *tmp = NULL;
+            pthread_mutex_lock(&heartbeat->ping_table_mtx);
+            list_for_each_entry_safe (entry, tmp, &heartbeat->ping_table, list)
             {
                 send_flag = 0;
                 gettimeofday(&now, NULL);
@@ -143,11 +145,9 @@ void *send_udp_packet(void *data)
                     }
                 }
             }
+            pthread_mutex_unlock(&heartbeat->ping_table_mtx);
         }
-
     }
-    pthread_mutex_destroy(&mutex);
-    pthread_cond_destroy(&cond);
 }
 
 void recv_udp_message(int sockfd)
@@ -173,11 +173,12 @@ void recv_udp_message(int sockfd)
         memset(&recv_data, 0, sizeof(recv_data));
         memcpy(&recv_data, ipbuf, sizeof(recv_data)+1);
 
-        //pthread_mutex_lock(&ping_mutex);
-        if(!list_empty(&ping_table)){
+        if(!list_empty(&heartbeat->ping_table)){
             gettimeofday(&tv, NULL);
             struct ping_entry *entry = NULL;
-            list_for_each_entry(entry, &ping_table, list)
+            struct ping_entry *tmp = NULL;
+            pthread_mutex_lock(&heartbeat->ping_table_mtx);
+            list_for_each_entry_safe(entry, tmp, &heartbeat->ping_table, list)
             {
                 if(entry->src.sin_port != recv_data.dst.sin_port){
                     continue;
@@ -194,8 +195,8 @@ void recv_udp_message(int sockfd)
 
                 entry->tv_recv = tv;
             }
+            pthread_mutex_unlock(&heartbeat->ping_table_mtx);
         }
-        //pthread_mutex_unlock(&ping_mutex);
 
         strcpy(ip, inet_ntoa(recv_data.src.sin_addr));
         printf("Recv success,src=%s:%d\n", ip, ntohs(recv_data.src.sin_port));
@@ -210,22 +211,21 @@ void check_heartbeat_timeout()
     struct timeval tv = {};
     unsigned long diff = 0;
 
-    //while(1){
-        gettimeofday(&tv, NULL);
-        pthread_mutex_lock(&ping_mutex);
-        if(!list_empty(&ping_table)){
-            struct ping_entry *entry = NULL;
-            list_for_each_entry(entry, &ping_table, list)
-            {
-                diff = timediff(tv, entry->tv_recv);
-                printf("diff=%ld\n", diff);//us
-                if(diff > entry->timeout){
-                    printf("timed out!diff=%ld\n", diff);//us
-                }
+    gettimeofday(&tv, NULL);
+    if(!list_empty(&heartbeat->ping_table)){
+        struct ping_entry *entry = NULL;
+        struct ping_entry *tmp = NULL;
+        pthread_mutex_lock(&heartbeat->ping_table_mtx);
+        list_for_each_entry_safe(entry, tmp, &heartbeat->ping_table, list)
+        {
+            diff = timediff(tv, entry->tv_recv);
+            printf("diff=%ld\n", diff);//us
+            if(diff > entry->timeout){
+                printf("timed out!diff=%ld\n", diff);//us
             }
         }
-        pthread_mutex_unlock(&ping_mutex);
-    //}
+        pthread_mutex_unlock(&heartbeat->ping_table_mtx);
+    }
 }
 
 void *recv_udp_packet(void *data)
@@ -234,72 +234,50 @@ void *recv_udp_packet(void *data)
     struct ping_data recv_data = {0};
     struct udp_socket udp_socket[10];
     int    i     = 0;
-    struct pollfd fds = {0};
+    struct pollfd pollfd[100] = {0};
+    int    active_fd_count = 0;
+
+    if(heartbeat == NULL) {
+        printf("heart beat is null!\n");
+        return NULL;
+    }
 
     while (1)
     {
-        if(!list_empty(&ping_table))
+        if(!list_empty(&heartbeat->ping_table))
         {
             struct ping_entry *entry = NULL;
-            list_for_each_entry (entry, &ping_table, list)//安全:w
+            struct ping_entry *tmp = NULL;
+            pthread_mutex_lock(&heartbeat->ping_table_mtx);
+            list_for_each_entry_safe (entry, tmp, &heartbeat->ping_table, list)//安全:w
             {
-                fds.fd = entry->sockfd;
-                fds.events = POLLIN;
+                pollfd[i].fd = entry->sockfd;
+                pollfd[i].events = POLLIN;
+                i++;
             }
-#if 1
-                ret = poll(&fds, fd_count, 1000);
-                if(ret < 0){
-                    printf("poll failed!\n");
-                    continue;
-                }
+            pthread_mutex_unlock(&heartbeat->ping_table_mtx);
 
-                for(i = 0;i < fd_count; i++)
+            active_fd_count = poll(&pollfd[0], heartbeat->fd_count, 1000);
+            if(ret < 0){
+                printf("poll failed!\n");
+                continue;
+            }
+
+            printf("active_fd_count=%d\n", active_fd_count);
+            for(i = 0;i < active_fd_count; i++)
+            {
+                if((pollfd[i].revents & POLLIN) == POLLIN)
                 {
-                    if((fds.revents & POLLIN) == POLLIN)
-                    {
-                        recv_udp_message(fds.fd);
-                    }
+                    recv_udp_message(pollfd[i].fd);
                 }
-                check_heartbeat_timeout();
-#endif
+            }
+            check_heartbeat_timeout();
         }
     }
 }
 
-int heartbeat_init()
-{
-    int ret = -1;
 
-    if (ping_initialized){ //放到结构体里，加锁j
-        return 0;
-    }
-
-    pthread_mutex_init(&ping_mutex, NULL);
-    INIT_LIST_HEAD(&ping_table);
-    ret = pthread_create(&sendpid, NULL, &send_udp_packet, NULL);
-    if(ret !=0 ){
-        printf("create send_udp_packet thread failed!\n");
-        goto out;
-    }
-    ret = pthread_create(&recvpid, NULL, &recv_udp_packet, NULL);
-    if(ret !=0 ){
-        printf("create recv_udp_packet thread failed!\n");
-        goto out;
-    }
-    //ret = pthread_create(&checkpid, NULL, &check_heartbeat_timeout, NULL);
-    //if(ret !=0 ){
-    //    printf("create check heartbeat timeout thread failed!\n");
-    //    goto out;
-    //}
-
-    ping_initialized = 1;
-
-    ret = 0;
-out:
-    return ret;
-}
-
-void reconfigure_interval_and_timeout(int interval, int timeout)
+void reconfigure_heartbeat_info(int interval, int timeout)
 {
 
 }
@@ -324,8 +302,8 @@ static int set_fd_nonblock(int sockfd)
    return ret;
 }
 
-int register_raw_ping_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
-                           unsigned int interval, unsigned int timeout, int pid)//pid用getpid
+int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
+                           unsigned int interval, unsigned int timeout)//pid用getpid
 {
     struct sockaddr_in *src = NULL;
     struct sockaddr_in *dst = NULL;
@@ -335,6 +313,10 @@ int register_raw_ping_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     char src_addr[20] = {0};
     char dst_addr[20] = {0};
     struct timeval tv = {0};
+
+    if(ssa == NULL || dsa == NULL) {
+        goto out;
+    }
 
     src = ssa;//指针为空判断
     dst = dsa;
@@ -355,14 +337,12 @@ int register_raw_ping_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     ret = set_fd_nonblock(sockfd);
     if(ret == -1){
         printf("set fd nonblock failed,err=%s\n", strerror(errno));
-        close(sockfd);
         goto out;
     }
 
     ret = bind(sockfd, (struct sockaddr *)src, sizeof(struct sockaddr_in));
     if(ret != 0){
         printf("bind socket failed,ret=%d,error=%s\n",ret, strerror(errno));
-        close(sockfd);
         goto out;
     }
 
@@ -373,20 +353,23 @@ int register_raw_ping_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     entry->interval = interval * 1000; //us
     entry->timeout = timeout * 1000; //us
     gettimeofday(&entry->tv_send, NULL);
-    //entry->tv_recv = tv;
-    entry->pid = pid;
+    entry->tv_recv = tv;
+    //entry->pid = pid;
     entry->sockfd = sockfd;
 
-    pthread_mutex_lock(&ping_mutex);
-    list_add_tail(&entry->list, &ping_table);
-    fd_count++;//struct
-    pthread_mutex_unlock(&ping_mutex);
+    pthread_mutex_lock(&heartbeat->ping_table_mtx);
+    list_add_tail(&entry->list, &heartbeat->ping_table);
+    heartbeat->fd_count++;
+    pthread_mutex_unlock(&heartbeat->ping_table_mtx);
 
     ret = 0;
     return ret;
 out:
     if(entry) {
         free(entry);
+    }
+    if(sockfd) {
+        close(sockfd);
     }
     return ret;
 
@@ -473,11 +456,54 @@ int old_poll()
 
 }
 
+int heartbeat_init()
+{
+    int ret = -1;
+
+    if (heartbeat != NULL) {
+        if (heartbeat->ping_initialized == 1) {
+            printf("heartbeat has initialized!\n");
+            goto out;
+        }
+    }
+
+    heartbeat = (heartbeat_t *)calloc(1, sizeof(heartbeat_t));
+    if(heartbeat == NULL) {
+        printf("calloc heartbeat failed!\n");
+        goto out;
+    }
+
+    pthread_mutex_init(&heartbeat->ping_table_mtx, NULL);
+    INIT_LIST_HEAD(&heartbeat->ping_table);
+    ret = pthread_create(&sendpid, NULL, &send_udp_packet, NULL);
+    if(ret !=0 ){
+        printf("create send_udp_packet thread failed!\n");
+        goto out;
+    }
+    ret = pthread_create(&recvpid, NULL, &recv_udp_packet, NULL);
+    if(ret !=0 ){
+        printf("create recv_udp_packet thread failed!\n");
+        goto out;
+    }
+    //ret = pthread_create(&checkpid, NULL, &check_heartbeat_timeout, NULL);
+    //if(ret !=0 ){
+    //    printf("create check heartbeat timeout thread failed!\n");
+    //    goto out;
+    //}
+
+    heartbeat->ping_initialized = 1;
+
+    ret = 0;
+out:
+    return ret;
+}
+
 int main(int argc,char *argv[])
 {
     int ret = -1;
     struct sockaddr_in client_addr = {0};
     struct sockaddr_in server_addr = {0};
+    struct sockaddr_in client_addr1 = {0};
     int sockfd = 0;
 
     bzero(&client_addr, sizeof(client_addr));
@@ -491,7 +517,7 @@ int main(int argc,char *argv[])
     server_addr.sin_port = htons(SERVER_PORT);
 
     ret = heartbeat_init();
-    ret = register_raw_ping_info(&client_addr, &server_addr, 100, 800, 0);
+    ret = register_heartbeat_info(&client_addr, &server_addr, 200, 800);
 
     pthread_join(sendpid,(void*)&send_udp_packet);
     pthread_join(recvpid,(void*)&recv_udp_packet);
