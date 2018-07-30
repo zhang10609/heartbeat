@@ -19,13 +19,10 @@
 #include <stdbool.h>
 
 #include "list.h"
-//#include "logging.h"
 
-
-//static int ping_initialized = 0;
-//struct list_head ping_table;
 static pthread_t sendpid, recvpid, checkpid;
-//static int fd_count = 0;
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static int module_init = 0;
 
 #define SERVER_IP   "10.30.0.3"
 #define SERVER_PORT 8000
@@ -35,6 +32,11 @@ static pthread_t sendpid, recvpid, checkpid;
 #define HB_LOG_TIMESTR_SIZE 256
 #define GF_PRI_SUSECONDS   "06ld"
 #define LOG_FILE_PATH      "/var/log/heartbeat.log"
+#define gettid() syscall(__NR_gettid)
+#define tolerate_timeout_us 3 * 1000 * 1000
+#define RECV_PACKET_INIT 0      //init recv flag
+#define RECV_PACKET_RECONFIG 1  //reconfigure time and interval flag
+#define RECV_PACKET_NORMAL 2    //recv packet from server normally
 
 typedef enum {
     HB_LOG_NONE,
@@ -58,10 +60,10 @@ typedef struct hb_log_handle_{
 
 typedef struct _heartbeat {
     struct list_head ping_table;
-    int ping_initialized;
     int fd_count;
-    int heartbeat_exit;
-    pthread_mutex_t exit_mtx;
+    int thread_wait;
+    pthread_mutex_t wait_mtx;
+    pthread_cond_t wait_cond;
     pthread_mutex_t ping_table_mtx;
     hb_log_handle_t log;
 } heartbeat_t;
@@ -75,10 +77,12 @@ struct ping_entry {
     struct sockaddr_in dst;
     struct timeval tv_send;
     struct timeval tv_recv;
-    unsigned int    timeout;
-    unsigned int    interval;
-    int             sockfd;
-    int             pid;
+    unsigned int timeout;
+    unsigned int interval;
+    int sockfd;
+    int pid;
+    int recv_packet; //0:non packet recveived; 1:reconfigure timeout and interval;2:had recveived packet from server;
+    bool disconnect;
 };
 
 #pragma pack(1)
@@ -181,7 +185,7 @@ out:
 }
 
 int
-gf_vasprintf (char **string_ptr, const char *format, va_list arg)
+hb_vasprintf (char **string_ptr, const char *format, va_list arg)
 {
         va_list arg_save;
         char    *str = NULL;
@@ -195,10 +199,8 @@ gf_vasprintf (char **string_ptr, const char *format, va_list arg)
 
         size = vsnprintf (NULL, 0, format, arg);
         size++;
-        //str = GF_MALLOC (size, gf_common_mt_asprintf);
         str = malloc (size);
         if (str == NULL) {
-                /* log is done in GF_MALLOC itself */
                 return -1;
         }
         rv = vsnprintf (str, size, format, arg_save);
@@ -209,13 +211,13 @@ gf_vasprintf (char **string_ptr, const char *format, va_list arg)
 }
 
 int
-gf_asprintf (char **string_ptr, const char *format, ...)
+hb_asprintf (char **string_ptr, const char *format, ...)
 {
         va_list arg;
         int     rv = 0;
 
         va_start (arg, format);
-        rv = gf_vasprintf (string_ptr, format, arg);
+        rv = hb_vasprintf (string_ptr, format, arg);
         va_end (arg);
 
         return rv;
@@ -237,15 +239,6 @@ _hb_log (const char *domain, const char *file, const char *function, int line,
         int            ret  = 0;
         int            fd   = -1;
         struct tm   *tm = NULL;
-
-        //xlator_t      *this = NULL;
-        //cetusfs_ctx_t *ctx = NULL;
-
-        //this = THIS;
-        //ctx = this->ctx;
-
-        //if (!ctx)
-        //        goto out;
 
         if (skip_logging (level))
                 goto out;
@@ -274,96 +267,23 @@ _hb_log (const char *domain, const char *file, const char *function, int line,
                 basename++;
         else
                 basename = file;
-
-#if 0
-        if (ctx->log.log_control_file_found)
-        {
-                int priority;
-                /* treat GF_LOG_TRACE and GF_LOG_NONE as LOG_DEBUG and
-                   other level as is */
-                if (GF_LOG_TRACE == level || GF_LOG_NONE == level) {
-                        priority = LOG_DEBUG;
-                } else {
-                        priority = level - 1;
-                }
-
-                va_start (ap, fmt);
-                vasprintf (&str2, fmt, ap);
-                va_end (ap);
-
-                //gf_syslog (priority, "[%s:%d:%s] %d-%s: %s",
-                //           basename, line, function,
-                //           ((this->graph) ? this->graph->id:0), domain, str2);
-                gf_syslog (priority, "[%s:%d:%s] : %s",
-                           basename, line, function, str2);
-                goto err;
-        }
-
-        if (ctx->log.logrotate) {
-                ctx->log.logrotate = 0;
-
-                fd = open (ctx->log.filename,
-                           O_CREAT | O_RDONLY, S_IRUSR | S_IWUSR);
-                if (fd < 0) {
-                        gf_msg ("logrotate", GF_LOG_ERROR, errno,
-                                LG_MSG_FILE_OP_FAILED,
-                                "failed to open logfile");
-                        return -1;
-                }
-                sys_close (fd);
-
-                new_logfile = fopen (ctx->log.filename, "a");
-                if (!new_logfile) {
-                        gf_msg ("logrotate", GF_LOG_CRITICAL, errno,
-                                LG_MSG_FILE_OP_FAILED,
-                                "failed to open logfile %s",
-                                ctx->log.filename);
-                        goto log;
-                }
-
-                pthread_mutex_lock (&ctx->log.logfile_mutex);
-                {
-                        if (ctx->log.logfile)
-                                fclose (ctx->log.logfile);
-
-                        ctx->log.gf_log_logfile =
-                                ctx->log.logfile = new_logfile;
-                }
-                pthread_mutex_unlock (&ctx->log.logfile_mutex);
-
-        }
-#endif
-
 log:
         ret = gettimeofday (&tv, NULL);
         if (-1 == ret)
                 goto out;
         va_start (ap, fmt);
-        //gf_time_fmt (timestr, sizeof timestr, tv.tv_sec, gf_timefmt_FT);
-        //snprintf (timestr + strlen (timestr), sizeof timestr - strlen (timestr),
-         //         ".%"GF_PRI_SUSECONDS, tv.tv_usec);
-         tm = localtime (&tv.tv_sec);
-         strftime (timestr, 256, "%Y-%m-%d %H:%M:%S", tm);
-         snprintf (timestr + strlen (timestr), 256 - strlen (timestr), ".%"GF_PRI_SUSECONDS, tv.tv_usec);
+        tm = localtime (&tv.tv_sec);
+        strftime (timestr, 256, "%Y-%m-%d %H:%M:%S", tm);
+        snprintf (timestr + strlen (timestr), 256 - strlen (timestr), ".%"GF_PRI_SUSECONDS, tv.tv_usec);
 
-//#ifdef GF_LINUX_HOST_OS
-            #define gettid() syscall(__NR_gettid)
-//#else
-//            #define gettid() 0
-//#endif
-
-        //ret = gf_asprintf (&str1, "[%s] %s [%s:%d:%s] tid:%d %d-%s: ",
-        //                   timestr, level_strings[level],
-        //                   basename, line, function,gettid(),
-        //                   ((this->graph)?this->graph->id:0), domain);
-        ret = gf_asprintf (&str1, "[%s] %s [%s:%d:%s] tid:%d %s: ",
+        ret = hb_asprintf (&str1, "[%s] %s [%s:%d:%s] tid:%d %s: ",
                            timestr, level_strings[level],
                            basename, line, function, gettid(), domain);
         if (-1 == ret) {
                 goto err;
         }
 
-        ret = gf_vasprintf (&str2, fmt, ap);
+        ret = hb_vasprintf (&str2, fmt, ap);
         if (-1 == ret) {
                 goto err;
         }
@@ -371,7 +291,6 @@ log:
         va_end (ap);
 
         len = strlen (str1);
-        //msg = GF_MALLOC (len + strlen (str2) + 1, gf_common_mt_char);
         msg = malloc (len + strlen (str2) + 1);
         if (!msg) {
                 goto err;
@@ -380,7 +299,6 @@ log:
         strcpy (msg, str1);
         strcpy (msg + len, str2);
 
-        //pthread_mutex_lock (&ctx->log.logfile_mutex);
         pthread_mutex_lock (&heartbeat->log.logfile_mutex);
         {
 
@@ -392,16 +310,8 @@ log:
                         fflush (stderr);
                 }
 
-#ifdef GF_LINUX_HOST_OS
-                /* We want only serious log in 'syslog', not our debug
-                   and trace logs */
-                if (ctx->log.gf_log_syslog && level &&
-                    (level <= ctx->log.sys_log_level))
-                        syslog ((level-1), "%s\n", msg);
-#endif
         }
         pthread_mutex_unlock (&heartbeat->log.logfile_mutex);
-        //pthread_mutex_unlock (&ctx->log.logfile_mutex);
 
 err:
         free (msg);
@@ -415,6 +325,16 @@ out:
         return (0);
 }
 
+static void wait_timeout_ms(unsigned int ms, struct timespec *timeout)
+{
+    struct timeval now = {0};
+    unsigned long nsec = 0;
+
+    gettimeofday (&now, NULL);
+    nsec = now.tv_usec * 1000 + (ms % 1000) * 1000 * 1000;
+    timeout->tv_nsec = nsec % (1000 * 1000 * 1000);
+    timeout->tv_sec = now.tv_sec + nsec/(1000 * 1000 * 1000) + ms / 1000;;
+}
 
 static unsigned int inline timediff(struct timeval tv1, struct timeval tv2)
 {
@@ -444,24 +364,32 @@ void *send_udp_message(void *data)
     int ret = 0;
     char src_addr[20] = {0};
     char dst_addr[20] = {0};
-    struct timeval now = {};
-    struct timeval tv = {};
-    struct timespec timeout = {};
+    struct timeval now = {0};
+    struct timespec timeout = {0};
     unsigned long time = 0;
     unsigned nsec = 0;
-    int send_flag = 0;
     unsigned int elapse_time_us = 0;
+    int interval = 0;
 
     if (heartbeat == NULL) {
         hb_log("heartbeat", HB_LOG_ERROR, "heartbeat=%p", heartbeat);
         return NULL;
     }
 
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_mutex_init (&mutex, NULL);
+    pthread_cond_init (&cond, NULL);
+
     while(1) {
-        if (heartbeat->heartbeat_exit == 1) {
-            hb_log("heartbeat", HB_LOG_INFO, "send message thread exit");
-            break;
+
+        pthread_mutex_lock (&heartbeat->wait_mtx);
+        while (heartbeat->thread_wait == 1) {
+            hb_log("heartbeat", HB_LOG_INFO, "send message thread wait start.......");
+            pthread_cond_wait (&heartbeat->wait_cond, &heartbeat->wait_mtx);
+            hb_log("heartbeat", HB_LOG_INFO, "send message thread wait end.......");
         }
+        pthread_mutex_unlock (&heartbeat->wait_mtx);
 
         if(!list_empty(&heartbeat->ping_table)){
             struct ping_entry *entry = NULL;
@@ -469,46 +397,41 @@ void *send_udp_message(void *data)
             pthread_mutex_lock(&heartbeat->ping_table_mtx);
             list_for_each_entry_safe (entry, tmp, &heartbeat->ping_table, list)
             {
-                send_flag = 0;
                 gettimeofday(&now, NULL);
                 elapse_time_us = timediff(now, entry->tv_send);
 
-                if(elapse_time_us > entry->interval && elapse_time_us != ~0U) {
-                    send_flag = 1;
-                } else {
+                if (elapse_time_us < entry->interval) {
                     continue;
                 }
 
-                if (send_flag) {
-                    memset(&send_data, 0, sizeof(send_data));
-                    send_data.src = entry->src;
-                    send_data.dst = entry->dst;
-                    send_data.value = 137;
-                    sockfd = entry->sockfd;
+                interval = entry->interval; //us
+                memset(&send_data, 0, sizeof(send_data));
+                send_data.src = entry->src;
+                send_data.dst = entry->dst;
+                send_data.value = 137;
+                sockfd = entry->sockfd;
 
-                    strcpy(src_addr, inet_ntoa(entry->src.sin_addr));
-                    strcpy(dst_addr, inet_ntoa(entry->dst.sin_addr));
-                    char *send_buf = (char *)&send_data;
+                strcpy(src_addr, inet_ntoa(entry->src.sin_addr));
+                strcpy(dst_addr, inet_ntoa(entry->dst.sin_addr));
+                char *send_buf = (char *)&send_data;
 
-                    gettimeofday(&tv, NULL);
-                    //printf("tv=%lu\n", 1000 * 1000 * tv.tv_sec + tv.tv_usec);
-
-                    ret = sendto(sockfd, send_buf, sizeof(send_data), 0, (struct sockaddr *)&entry->dst, sizeof(entry->dst));
-                    if (ret == -1 || ret < sizeof(data)) {
-                        hb_log("heartbeat", HB_LOG_ERROR, "Send failed, from ip=%s:%d,to ip=%s:%d,err=%s",
-                              src_addr, ntohs(entry->src.sin_port),
-                              dst_addr, ntohs(entry->dst.sin_port),
-                              strerror(errno));
-                    } else {
-                        entry->tv_send = now;
-                        hb_log("heartbeat", HB_LOG_INFO, "Send success, from ip=%s:%d,to ip=%s:%d",
-                              src_addr, ntohs(entry->src.sin_port),
-                              dst_addr, ntohs(entry->dst.sin_port));
-                    }
+                ret = sendto(sockfd, send_buf, sizeof(send_data), 0, (struct sockaddr *)&entry->dst, sizeof(entry->dst));
+                if (ret == -1 || ret < sizeof(data)) {
+                    hb_log("heartbeat", HB_LOG_ERROR, "Send failed, from ip=%s:%d,to ip=%s:%d,err=%s",
+                          src_addr, ntohs(entry->src.sin_port),
+                          dst_addr, ntohs(entry->dst.sin_port),
+                          strerror(errno));
+                } else {
+                    entry->tv_send = now;
+                    hb_log("heartbeat", HB_LOG_INFO, "Send success, from ip=%s:%d,to ip=%s:%d",
+                          src_addr, ntohs(entry->src.sin_port),
+                          dst_addr, ntohs(entry->dst.sin_port));
                 }
             }
             pthread_mutex_unlock(&heartbeat->ping_table_mtx);
         }
+        wait_timeout_ms(interval/(10*1000), &timeout);
+        pthread_cond_timedwait (&cond, &mutex, &timeout);
     }
     return NULL;
 }
@@ -561,6 +484,7 @@ void recv_udp_packet(int sockfd)
                 }
 
                 entry->tv_recv = tv;
+                entry->recv_packet = RECV_PACKET_NORMAL; //have recevied packet
                 hb_log("heartbeat", HB_LOG_DEBUG, "tv_recv=%lu",
                    1000 * 1000 * entry->tv_recv. tv_sec + entry->tv_recv.tv_usec);
             }
@@ -575,51 +499,73 @@ void recv_udp_packet(int sockfd)
 
 void *check_heartbeat_timeout(void *data)
 {
-    struct timeval start_tv = {};
-    struct timeval end_tv = {};
-    struct timeval tv = {};
-    struct timeval now = {};
+    struct timeval start_tv = {0};
+    struct timeval end_tv = {0};
+    struct timeval now = {0};
+    struct timespec timeout_ms = {0};
     unsigned long diff = 0;
     unsigned int elapse_time_us = 0;
+    unsigned int entry_timeout = 0;
     int first_flag = 0;
+    struct timespec timeout = {0};
 
     if (heartbeat == NULL) {
         hb_log("heartbeat", HB_LOG_ERROR, "heartbeat=%p", heartbeat);
         return NULL;
     }
 
-    while(1) {
-        gettimeofday(&now, NULL);
-        if(!list_empty(&heartbeat->ping_table)){
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_mutex_init (&mutex, NULL);
+    pthread_cond_init (&cond, NULL);
+
+    while(1) { //加一个wait
+
+        pthread_mutex_lock (&heartbeat->wait_mtx);
+        while (heartbeat->thread_wait == 1) {
+            hb_log("heartbeat", HB_LOG_INFO, "check timeout thread wait start.......");
+            pthread_cond_wait (&heartbeat->wait_cond, &heartbeat->wait_mtx);
+            hb_log("heartbeat", HB_LOG_INFO, "check timeout thread wait end.......");
+        }
+        pthread_mutex_unlock (&heartbeat->wait_mtx);
+
+        if (!list_empty(&heartbeat->ping_table)){
             struct ping_entry *entry = NULL;
             struct ping_entry *tmp = NULL;
             pthread_mutex_lock(&heartbeat->ping_table_mtx);
             list_for_each_entry_safe(entry, tmp, &heartbeat->ping_table, list)
             {
-                if (entry->tv_recv.tv_sec == 0 && entry->tv_recv.tv_usec == 0) {
-                    if (first_flag == 0){
-                        gettimeofday(&tv, NULL);
-                        first_flag = 1;
-                    }
-                    elapse_time_us = timediff(now, tv);
-                    if (elapse_time_us < 3000 * 1000) {
-                        goto do_nothing;
-                    }
-                    hb_log ("heartbeat", HB_LOG_WARNING, "Not recv any packet from server in last 3 seconds!");
-                    first_flag = 0;
-                }
+                //if (entry->disconnect == 1) {
+                //    continue;
+                //}
 
-                diff = timediff(now, entry->tv_recv);
-                if(diff > entry->timeout && diff != ~0U){
-                    hb_log ("heartbeat", HB_LOG_INFO, "timeout!now=%lu,recv=%lu,diff=%lu",
-                      1000 * 1000 * now.tv_sec + now.tv_usec,
-                      1000 * 1000 * entry->tv_recv.tv_sec + entry->tv_recv.tv_usec,
-                      diff); //us
+                entry_timeout = entry->timeout;
+                gettimeofday (&now, NULL);
+                if (entry->recv_packet == RECV_PACKET_INIT || entry->recv_packet == RECV_PACKET_RECONFIG) {
+                    elapse_time_us = timediff (now, entry->tv_recv);
+                    if (elapse_time_us > tolerate_timeout_us) {
+                        entry->disconnect = 1;
+                        hb_log ("heartbeat", HB_LOG_WARNING, "Not recv any packet from ip=%s:%d in last %d seconds!",
+                                inet_ntoa(entry->dst.sin_addr), ntohs(entry->dst.sin_port), elapse_time_us/1000000);
+                    }
+                } else if (entry->recv_packet == RECV_PACKET_NORMAL) {
+                    diff = timediff(now, entry->tv_recv);
+                    if (diff >= entry->timeout) {
+                        entry->disconnect = 1;
+                        hb_log ("heartbeat", HB_LOG_INFO, "timeout!nowtime=%lu,recvtime=%lu,diff=%lu,"
+                                                         "from ip=%s:%d",
+                          1000 * 1000 * now.tv_sec + now.tv_usec,
+                          1000 * 1000 * entry->tv_recv.tv_sec + entry->tv_recv.tv_usec,
+                          diff,
+                          inet_ntoa(entry->dst.sin_addr), ntohs(entry->dst.sin_port)); //us
+                    }
                 }
-do_nothing:
-;
             }
+
+            hb_log ("heartbeat", HB_LOG_DEBUG, "timeout=%d", entry_timeout);
             pthread_mutex_unlock(&heartbeat->ping_table_mtx);
+            wait_timeout_ms(entry_timeout/(100*1000), &timeout);
+            pthread_cond_timedwait (&cond, &mutex, &timeout);
         }
     }
 }
@@ -631,17 +577,28 @@ void *recv_udp_message(void *data)
     struct udp_socket udp_socket[10];
     int    i     = 0;
     struct pollfd pollfd[100] = {0};
+    unsigned int entry_timeout = 0;
+    struct timespec timeout = {0};
 
     if(heartbeat == NULL) {
         hb_log("heartbeat", HB_LOG_ERROR, "heartbeat=%p", heartbeat);
         return NULL;
     }
 
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_mutex_init (&mutex, NULL);
+    pthread_cond_init (&cond, NULL);
+
     while (1)
     {
-        if (heartbeat->heartbeat_exit == 1) {
-            break;
+        pthread_mutex_lock (&heartbeat->wait_mtx);
+        while (heartbeat->thread_wait == 1) {
+            hb_log("heartbeat", HB_LOG_INFO, "recv message thread wait start.......");
+            pthread_cond_wait (&heartbeat->wait_cond, &heartbeat->wait_mtx);
+            hb_log("heartbeat", HB_LOG_INFO, "recv message thread wait end.......");
         }
+        pthread_mutex_unlock (&heartbeat->wait_mtx);
 
         if(!list_empty(&heartbeat->ping_table))
         {
@@ -651,13 +608,14 @@ void *recv_udp_message(void *data)
             pthread_mutex_lock(&heartbeat->ping_table_mtx);
             list_for_each_entry_safe (entry, tmp, &heartbeat->ping_table, list)
             {
+                entry_timeout = entry->interval;
                 pollfd[i].fd = entry->sockfd;
                 pollfd[i].events = POLLIN;
                 i++;
             }
             pthread_mutex_unlock(&heartbeat->ping_table_mtx);
 
-            ret = poll(&pollfd[0], heartbeat->fd_count, 100);
+            ret = poll(&pollfd[0], heartbeat->fd_count, -1);
             if(ret < 0){
                 hb_log("heartbeat", HB_LOG_ERROR, "poll failed, err=%s", strerror(errno));
                 continue;
@@ -673,14 +631,24 @@ void *recv_udp_message(void *data)
                 }
             }
         }
+
+        wait_timeout_ms(entry_timeout/(10*1000), &timeout);
+        pthread_cond_timedwait (&cond, &mutex, &timeout);
     }
     return NULL;
 }
 
 
-void
+int
 reconfigure_heartbeat_info(int interval, int timeout)
 {
+    int ret = -1;
+
+    if (interval < 0 || timeout < 0) {
+        hb_log ("heartbeat", HB_LOG_ERROR, "invalid input parameter");
+        goto out;
+    }
+
     if (!list_empty(&heartbeat->ping_table)) {
         struct ping_entry *entry = NULL;
         struct ping_entry *tmp = NULL;
@@ -688,15 +656,24 @@ reconfigure_heartbeat_info(int interval, int timeout)
         list_for_each_entry_safe(entry, tmp, &heartbeat->ping_table, list) {
             entry->interval = interval * 1000;
             entry->timeout = timeout * 1000;
+            entry->recv_packet = RECV_PACKET_RECONFIG;
         }
         pthread_mutex_unlock(&heartbeat->ping_table_mtx);
     }
 
-    pthread_mutex_lock(&heartbeat->exit_mtx);
+    pthread_mutex_lock(&heartbeat->wait_mtx);
     if (interval == 0) {
-        heartbeat->heartbeat_exit = 1;
+        heartbeat->thread_wait = 1;
+    } else {
+        heartbeat->thread_wait = 0;
+        pthread_cond_broadcast (&heartbeat->wait_cond);
     }
-    pthread_mutex_unlock(&heartbeat->exit_mtx);
+    pthread_mutex_unlock(&heartbeat->wait_mtx);
+
+    ret = 0;
+
+out :
+    return ret;
 }
 
 static int set_fd_nonblock(int sockfd)
@@ -720,7 +697,7 @@ static int set_fd_nonblock(int sockfd)
 }
 
 int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
-                           unsigned int interval, unsigned int timeout)//pid用getpid
+                           unsigned int interval, unsigned int timeout)
 {
     struct sockaddr_in *src = NULL;
     struct sockaddr_in *dst = NULL;
@@ -731,9 +708,8 @@ int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     char dst_addr[20] = {0};
     struct timeval tv = {0};
 
-    if(ssa == NULL || dsa == NULL) {
-      hb_log("heartbeat", HB_LOG_ERROR, "ssa=%p, dsa=%p",
-               ssa, dsa );
+    if(ssa == NULL || dsa == NULL || interval < 0 || timeout < 0) {
+      hb_log("heartbeat", HB_LOG_ERROR, "invalid parameter");
         goto out;
     }
 
@@ -769,16 +745,16 @@ int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
         goto out;
     }
 
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
     entry->src = *src;
     entry->dst = *dst;
     entry->interval = interval * 1000; //us
     entry->timeout = timeout * 1000; //us
     gettimeofday(&entry->tv_send, NULL);
-    entry->tv_recv = tv;
+    gettimeofday(&entry->tv_recv, NULL);
     entry->pid = getpid();
     entry->sockfd = sockfd;
+    entry->recv_packet = RECV_PACKET_INIT; //init 0 indicate not recevied any packet yet
+    entry->disconnect = 0;
 
     pthread_mutex_lock(&heartbeat->ping_table_mtx);
     list_add_tail(&entry->list, &heartbeat->ping_table);
@@ -833,6 +809,7 @@ int unregister_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa)
         }
 
         if (found) {
+            heartbeat->fd_count--;
             close(entry->sockfd);
             list_del_init(&entry->list);
             free(&entry->list);
@@ -849,11 +826,10 @@ int heartbeat_init()
 {
     int ret = -1;
 
-    if (heartbeat != NULL) {
-        if (heartbeat->ping_initialized == 1) {
-            fprintf(stderr, "heartbeat has initialized!\n");
-            goto out;
-        }
+    pthread_mutex_lock(&mtx); //avoid two threads init at the same time
+    if(module_init == 1) { //avoid init more than one times
+        hb_log("heartbeat", HB_LOG_ERROR, "heartbeat module had initialized");
+        goto out;
     }
 
     heartbeat = (heartbeat_t *)calloc(1, sizeof(heartbeat_t));
@@ -867,10 +843,10 @@ int heartbeat_init()
         fprintf(stderr, "failed to init log file %s", strerror(errno));
     }
 
-    heartbeat->ping_initialized = 1;
-    heartbeat->heartbeat_exit = 0;
+    heartbeat->thread_wait = 0;
     pthread_mutex_init(&heartbeat->ping_table_mtx, NULL);
-    pthread_mutex_init(&heartbeat->exit_mtx, NULL);
+    pthread_mutex_init(&heartbeat->wait_mtx, NULL);
+    pthread_cond_init(&heartbeat->wait_cond, NULL);
     INIT_LIST_HEAD(&heartbeat->ping_table);
 
     ret = pthread_create(&sendpid, NULL, &send_udp_message, NULL);
@@ -888,9 +864,10 @@ int heartbeat_init()
         hb_log("heartbeat", HB_LOG_ERROR, "create check_heartbeat_timeout thread failed!");
         goto out;
     }
-
-
     ret = 0;
+    module_init = 1;
+    pthread_mutex_unlock(&mtx);
+
 out:
     return ret;
 }
@@ -904,6 +881,8 @@ int main(int argc,char *argv[])
     struct sockaddr_in server_addr1 = {0};
     struct sockaddr_in client_addr2 = {0};
     struct sockaddr_in server_addr2 = {0};
+    struct sockaddr_in client_addr3 = {0};
+    struct sockaddr_in server_addr3 = {0};
     int sockfd = 0;
 
     bzero(&client_addr, sizeof(client_addr));
@@ -936,15 +915,29 @@ int main(int argc,char *argv[])
     server_addr2.sin_addr.s_addr = inet_addr(SERVER_IP);
     server_addr2.sin_port = htons(8002);
 
+    bzero(&client_addr3, sizeof(client_addr3));
+    client_addr3.sin_family = AF_INET;
+    client_addr3.sin_addr.s_addr = inet_addr(CLIENT_IP);
+    client_addr3.sin_port = htons(8003);
+
+    bzero(&server_addr3, sizeof(server_addr3));
+    server_addr3.sin_family = AF_INET;
+    server_addr3.sin_addr.s_addr = inet_addr(SERVER_IP);
+    server_addr3.sin_port = htons(8003);
+
     ret = heartbeat_init();
     ret = register_heartbeat_info(&client_addr, &server_addr, 100, 800);
     ret = register_heartbeat_info(&client_addr1, &server_addr1, 100, 800);
     ret = register_heartbeat_info(&client_addr2, &server_addr2, 100, 800);
+    ret = register_heartbeat_info(&client_addr3, &server_addr3, 100, 800);
 
-    //sleep(10);
-    //reconfigure_heartbeat_info(0, 3000);
+    //sleep (10);
+    //ret = reconfigure_heartbeat_info(-1, 3000);
     //ret = unregister_heartbeat_info(&client_addr, &server_addr);
     //hb_log("heartbeat", HB_LOG_INFO, "ret=%d", ret);
+    //sleep(10);
+    //reconfigure_heartbeat_info(200, 3000);
+    //ret = register_heartbeat_info(&client_addr, &server_addr, 100, 800);
     pthread_join(sendpid,(void*)&send_udp_message);
     pthread_join(recvpid,(void*)&recv_udp_message);
     pthread_join(recvpid,(void*)&check_heartbeat_timeout);
