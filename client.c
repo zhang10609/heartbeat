@@ -883,8 +883,10 @@ int heartbeat_init()
     ret = 0;
     module_init = 1;
     pthread_mutex_unlock(&mtx);
+    return ret;
 
 out:
+    pthread_mutex_unlock(&mtx);
     return ret;
 }
 
