@@ -519,8 +519,7 @@ void *check_heartbeat_timeout(void *data)
     pthread_mutex_init (&mutex, NULL);
     pthread_cond_init (&cond, NULL);
 
-    while(1) { //加一个wait
-
+    while(1) {
         pthread_mutex_lock (&heartbeat->wait_mtx);
         while (heartbeat->thread_wait == 1) {
             hb_log("heartbeat", HB_LOG_INFO, "check timeout thread wait start.......");
@@ -529,15 +528,15 @@ void *check_heartbeat_timeout(void *data)
         }
         pthread_mutex_unlock (&heartbeat->wait_mtx);
 
-        if (!list_empty(&heartbeat->ping_table)){
+        if (!list_empty(&heartbeat->ping_table)) {
             struct ping_entry *entry = NULL;
             struct ping_entry *tmp = NULL;
             pthread_mutex_lock(&heartbeat->ping_table_mtx);
             list_for_each_entry_safe(entry, tmp, &heartbeat->ping_table, list)
             {
-                //if (entry->disconnect == 1) {
-                //    continue;
-                //}
+                if (entry->disconnect == 1) {
+                    continue;
+                }
 
                 entry_timeout = entry->timeout;
                 gettimeofday (&now, NULL);
@@ -649,6 +648,11 @@ reconfigure_heartbeat_info(int interval, int timeout)
         goto out;
     }
 
+    if (timeout < 3 * interval) {
+        hb_log ("heartbeat", HB_LOG_ERROR, "timeout need three times over interval at least!");
+        goto out;
+    }
+
     if (!list_empty(&heartbeat->ping_table)) {
         struct ping_entry *entry = NULL;
         struct ping_entry *tmp = NULL;
@@ -682,7 +686,7 @@ static int set_fd_nonblock(int sockfd)
     int  ret = -1;
 
     flag = fcntl(sockfd, F_GETFL, 0);
-    if(flag < 0)
+    if (flag < 0)
     {
         hb_log ("heartbeat", HB_LOG_ERROR, "fcntl get flag failed, err=%s", strerror(errno));
         return ret;
@@ -709,7 +713,7 @@ int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     struct timeval tv = {0};
 
     if(ssa == NULL || dsa == NULL || interval < 0 || timeout < 0) {
-      hb_log("heartbeat", HB_LOG_ERROR, "invalid parameter");
+        hb_log("heartbeat", HB_LOG_ERROR, "invalid parameter");
         goto out;
     }
 
@@ -742,6 +746,11 @@ int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     if(ret != 0) {
         hb_log("heartbeat", HB_LOG_ERROR, "bind socket failed,ret = %d, err=%s",
               ret, strerror(errno));
+        goto out;
+    }
+
+    if (timeout < 3 * interval) {
+        hb_log ("heartbeat", HB_LOG_ERROR, "timeout need three times over interval at least!");
         goto out;
     }
 
@@ -929,9 +938,11 @@ int main(int argc,char *argv[])
     ret = register_heartbeat_info(&client_addr, &server_addr, 100, 800);
     ret = register_heartbeat_info(&client_addr1, &server_addr1, 100, 800);
     ret = register_heartbeat_info(&client_addr2, &server_addr2, 100, 800);
-    ret = register_heartbeat_info(&client_addr3, &server_addr3, 100, 800);
+    //ret = register_heartbeat_info(&client_addr3, &server_addr3, 100, 800);
 
     //sleep (10);
+    //ret = register_heartbeat_info(&client_addr3, &server_addr3, 100, 200);
+    //ret = register_heartbeat_info(&client_addr, &server_addr, 100, 800);
     //ret = reconfigure_heartbeat_info(-1, 3000);
     //ret = unregister_heartbeat_info(&client_addr, &server_addr);
     //hb_log("heartbeat", HB_LOG_INFO, "ret=%d", ret);
