@@ -38,6 +38,8 @@ static int module_init = 0;
 #define RECV_PACKET_RECONFIG 1  //reconfigure time and interval flag
 #define RECV_PACKET_NORMAL 2    //recv packet from server normally
 
+typedef void (*heartbeat_callback)(struct sockaddr_in *src, struct sockaddr_in *dst);
+
 typedef enum {
     HB_LOG_NONE,
     HB_LOG_EMERG,
@@ -83,6 +85,7 @@ struct ping_entry {
     int pid;
     int recv_packet; //0:non packet recveived; 1:reconfigure timeout and interval;2:had recveived packet from server;
     bool disconnect;
+    heartbeat_callback hb_callback;
 };
 
 #pragma pack(1)
@@ -325,6 +328,8 @@ out:
         return (0);
 }
 
+
+
 static void wait_timeout_ms(unsigned int ms, struct timespec *timeout)
 {
     struct timeval now = {0};
@@ -544,6 +549,7 @@ void *check_heartbeat_timeout(void *data)
                     elapse_time_us = timediff (now, entry->tv_recv);
                     if (elapse_time_us > tolerate_timeout_us) {
                         entry->disconnect = 1;
+                        entry->hb_callback(&entry->dst, &entry->src);
                         hb_log ("heartbeat", HB_LOG_WARNING, "Not recv any packet from ip=%s:%d in last %d seconds!",
                                 inet_ntoa(entry->dst.sin_addr), ntohs(entry->dst.sin_port), elapse_time_us/1000000);
                     }
@@ -551,7 +557,8 @@ void *check_heartbeat_timeout(void *data)
                     diff = timediff(now, entry->tv_recv);
                     if (diff >= entry->timeout) {
                         entry->disconnect = 1;
-                        hb_log ("heartbeat", HB_LOG_INFO, "timeout!nowtime=%lu,recvtime=%lu,diff=%lu,"
+                        entry->hb_callback(&entry->dst, &entry->src);
+                        hb_log ("heartbeat", HB_LOG_WARNING, "timeout!nowtime=%lu,recvtime=%lu,diff=%lu,"
                                                          "from ip=%s:%d",
                           1000 * 1000 * now.tv_sec + now.tv_usec,
                           1000 * 1000 * entry->tv_recv.tv_sec + entry->tv_recv.tv_usec,
@@ -637,7 +644,6 @@ void *recv_udp_message(void *data)
     return NULL;
 }
 
-
 int
 reconfigure_heartbeat_info(int interval, int timeout)
 {
@@ -701,7 +707,7 @@ static int set_fd_nonblock(int sockfd)
 }
 
 int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
-                           unsigned int interval, unsigned int timeout)
+                           unsigned int interval, unsigned int timeout, heartbeat_callback callback)
 {
     struct sockaddr_in *src = NULL;
     struct sockaddr_in *dst = NULL;
@@ -764,6 +770,7 @@ int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     entry->sockfd = sockfd;
     entry->recv_packet = RECV_PACKET_INIT; //init 0 indicate not recevied any packet yet
     entry->disconnect = 0;
+    entry->hb_callback = callback;
 
     pthread_mutex_lock(&heartbeat->ping_table_mtx);
     list_add_tail(&entry->list, &heartbeat->ping_table);
@@ -881,6 +888,20 @@ out:
     return ret;
 }
 
+void
+hb_callback_test (struct sockaddr_in *src, struct sockaddr_in *dst)
+{
+
+    char src_addr[20] = {0};
+    char dst_addr[20] = {0};
+
+    strcpy(src_addr, inet_ntoa(src->sin_addr));
+    strcpy(dst_addr, inet_ntoa(dst->sin_addr));
+    hb_log ("heartbeat", HB_LOG_INFO, "src=%s:%d,dst=%s:%d has disconnect",
+                       src_addr, ntohs(src->sin_port),
+                       dst_addr, ntohs(dst->sin_port) );
+}
+
 int main(int argc,char *argv[])
 {
     int ret = -1;
@@ -935,9 +956,9 @@ int main(int argc,char *argv[])
     server_addr3.sin_port = htons(8003);
 
     ret = heartbeat_init();
-    ret = register_heartbeat_info(&client_addr, &server_addr, 100, 800);
-    ret = register_heartbeat_info(&client_addr1, &server_addr1, 100, 800);
-    ret = register_heartbeat_info(&client_addr2, &server_addr2, 100, 800);
+    ret = register_heartbeat_info(&client_addr, &server_addr, 100, 800, hb_callback_test);
+    ret = register_heartbeat_info(&client_addr1, &server_addr1, 100, 800, hb_callback_test);
+    ret = register_heartbeat_info(&client_addr2, &server_addr2, 100, 800, hb_callback_test);
     //ret = register_heartbeat_info(&client_addr3, &server_addr3, 100, 800);
 
     //sleep (10);
