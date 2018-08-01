@@ -123,6 +123,10 @@ skip_logging (hb_loglevel_t level)
 {
         bool ret = false;
         hb_loglevel_t existing_level = HB_LOG_NONE;
+        if (heartbeat == NULL) {
+            fprintf (stderr, "heartbeat=%p\n", heartbeat);
+            goto out;
+        }
 
         if (level == HB_LOG_NONE) {
                 ret = true;
@@ -263,6 +267,11 @@ _hb_log (const char *domain, const char *file, const char *function, int line,
                          "logging: %s:%s():%d: invalid argument\n",
                          __FILE__, __PRETTY_FUNCTION__, __LINE__);
                 return -1;
+        }
+
+        if (heartbeat == NULL) {
+            fprintf (stderr, "heartbeat=%p", heartbeat);
+            return -1;
         }
 
         basename = strrchr (file, '/');
@@ -659,6 +668,11 @@ reconfigure_heartbeat_info(int interval, int timeout)
         goto out;
     }
 
+    if (heartbeat == NULL) {
+        hb_log ("heartbeat", HB_LOG_ERROR, "heartbeat=%p", heartbeat);
+        goto out;
+    }
+
     if (!list_empty(&heartbeat->ping_table)) {
         struct ping_entry *entry = NULL;
         struct ping_entry *tmp = NULL;
@@ -717,6 +731,10 @@ int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     char src_addr[20] = {0};
     char dst_addr[20] = {0};
     struct timeval tv = {0};
+
+    if (heartbeat == NULL) {
+        hb_log ("heartbeat", HB_LOG_ERROR, "heartbeat=%p", heartbeat);
+    }
 
     if(ssa == NULL || dsa == NULL || interval < 0 || timeout < 0) {
         hb_log("heartbeat", HB_LOG_ERROR, "invalid parameter");
@@ -797,8 +815,12 @@ int unregister_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa)
     int ret = -1;
     int found = 0;
 
+    if (heartbeat == NULL) {
+        hb_log ("heartbeat", HB_LOG_ERROR, "heartbeat=%p", heartbeat);
+    }
+
     if (ssa == NULL || dsa == NULL) {
-        hb_log ("heartbeat", HB_LOG_ERROR, "ssa or dsa is null");
+        hb_log ("heartbeat", HB_LOG_ERROR, "invalid parameter");
         goto out;
     }
 
