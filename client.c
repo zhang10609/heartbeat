@@ -558,7 +558,9 @@ void *check_heartbeat_timeout(void *data)
                     elapse_time_us = timediff (now, entry->tv_recv);
                     if (elapse_time_us > tolerate_timeout_us) {
                         entry->disconnect = 1;
-                        entry->hb_callback(&entry->dst, &entry->src);
+                        if (entry->hb_callback) {
+                            entry->hb_callback(&entry->dst, &entry->src);
+                        }
                         hb_log ("heartbeat", HB_LOG_WARNING, "Not recv any packet from ip=%s:%d in last %d seconds!",
                                 inet_ntoa(entry->dst.sin_addr), ntohs(entry->dst.sin_port), elapse_time_us/1000000);
                     }
@@ -566,7 +568,9 @@ void *check_heartbeat_timeout(void *data)
                     diff = timediff(now, entry->tv_recv);
                     if (diff >= entry->timeout) {
                         entry->disconnect = 1;
-                        entry->hb_callback(&entry->dst, &entry->src);
+                        if (entry->hb_callback) {
+                            entry->hb_callback(&entry->dst, &entry->src);
+                        }
                         hb_log ("heartbeat", HB_LOG_WARNING, "timeout!nowtime=%lu,recvtime=%lu,diff=%lu,"
                                                          "from ip=%s:%d",
                           1000 * 1000 * now.tv_sec + now.tv_usec,
