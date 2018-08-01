@@ -774,6 +774,9 @@ int register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     if(ret != 0) {
         hb_log("heartbeat", HB_LOG_ERROR, "bind socket failed,ret = %d, err=%s",
               ret, strerror(errno));
+        if (errno == EADDRINUSE) {
+            /*TODO*/
+        }
         goto out;
     }
 
