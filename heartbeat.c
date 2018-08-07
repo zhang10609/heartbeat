@@ -8,7 +8,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
-#include <pthread.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -19,6 +18,7 @@
 #include <stdbool.h>
 
 #include "list.h"
+#include "heartbeat.h"
 
 static pthread_t sendpid, recvpid, checkpid;
 static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -39,10 +39,8 @@ static int module_init = 0;
 #define RECV_PACKET_NORMAL 2    //recv packet from server normally
 #define MAX_PORT 65535
 
-unsigned int packet_count = 0;
-unsigned int packet_size = 0;
 
-typedef void (*heartbeat_callback)(struct sockaddr_in *src, struct sockaddr_in *dst);
+//typedef void (*heartbeat_callback)(struct sockaddr_in *src, struct sockaddr_in *dst);
 
 typedef enum {
     HB_LOG_NONE,
@@ -90,13 +88,18 @@ struct ping_entry {
     int recv_packet; //0:non packet recveived; 1:reconfigure timeout and interval;2:had recveived packet from server;
     bool disconnect;
     heartbeat_callback hb_callback;
+	void *msg;
 };
 
 #pragma pack(1)
-struct ping_data {
+struct ping_packet {
     struct sockaddr_in src;
     struct sockaddr_in dst;
-    char data[10];
+	unsigned int packet_index;
+	unsigned int packet_length;
+    char packet_flag[10];
+    char packet_version[10];
+	char packet_remain[4];
 };
 #pragma pack()
 
@@ -375,7 +378,7 @@ static unsigned int inline timediff(struct timeval tv1, struct timeval tv2)
 
 void *send_udp_message(void *data)
 {
-    struct ping_data send_data = {0}; //42 bytes
+    struct ping_packet send_data = {0}; //64 bytes
     int sockfd = 0;
     int ret = 0;
     char src_addr[20] = {0};
@@ -384,6 +387,7 @@ void *send_udp_message(void *data)
     struct timespec timeout = {0};
     unsigned int elapse_time_us = 0;
     int interval = 0;
+	unsigned int index = 0;
 
     if (heartbeat == NULL) {
         hb_log("heartbeat", HB_LOG_ERROR, "heartbeat=%p", heartbeat);
@@ -418,13 +422,16 @@ void *send_udp_message(void *data)
                     continue;
                 }
 
-                char tmp_str[10] = "heartbeat";
                 interval = entry->interval; //us
                 memset(&send_data, 0, sizeof(send_data));
+                sockfd = entry->sockfd;
                 send_data.src = entry->src;
                 send_data.dst = entry->dst;
-                strcpy(send_data.data, tmp_str);
-                sockfd = entry->sockfd;
+				send_data.packet_index = index;
+				send_data.packet_length = sizeof(send_data);
+                strcpy(send_data.packet_flag, "heartbeat");
+				strcpy (send_data.packet_version, "V1.0");
+				index ++;
 
                 strcpy(src_addr, inet_ntoa(entry->src.sin_addr));
                 strcpy(dst_addr, inet_ntoa(entry->dst.sin_addr));
@@ -438,10 +445,12 @@ void *send_udp_message(void *data)
                           strerror(errno));
                 } else {
                     entry->tv_send = now;
-                    packet_count ++;
-                    hb_log("heartbeat", HB_LOG_INFO, "Send success, from ip=%s:%d,to ip=%s:%d,packet_count=%d",
+                    hb_log("heartbeat", HB_LOG_INFO, "Send success, from ip=%s:%d,to ip=%s:%d,"
+					                                 "flag=%s,version=%s,index=%d,length=%d",
                           src_addr, ntohs(entry->src.sin_port),
-                          dst_addr, ntohs(entry->dst.sin_port), packet_count);
+                          dst_addr, ntohs(entry->dst.sin_port),
+						  send_data.packet_flag, send_data.packet_version,
+						  send_data.packet_index, send_data.packet_length);
                 }
             }
             pthread_mutex_unlock(&heartbeat->ping_table_mtx);
@@ -457,7 +466,7 @@ void recv_udp_packet(int sockfd)
     struct sockaddr_in addr;
     char ipbuf[512];
     int  ret = -1;
-    struct ping_data recv_data = {0};
+    struct ping_packet recv_data = {0};
     char ip[20] = {0};
     struct timeval tv = {};
     char entry_ip[20] = {0};
@@ -467,12 +476,12 @@ void recv_udp_packet(int sockfd)
     memset(ipbuf, 0, sizeof(ipbuf));
     bzero(&addr,sizeof(addr));
 
-    ret = recvfrom(sockfd, ipbuf, sizeof(struct ping_data), 0, (struct sockaddr *)&addr, &addrlen);
+    ret = recvfrom(sockfd, ipbuf, sizeof(struct ping_packet), 0, (struct sockaddr *)&addr, &addrlen);
     if (ret == -1) {
         hb_log("heartbeat", HB_LOG_INFO, "Recv udp failed!,err=%s", strerror(errno));
     } else {
 
-        hb_log("heartbeat", HB_LOG_INFO, "Recv udp ip=%s:%d", inet_ntoa (addr.sin_addr), ntohs (addr.sin_port));
+        hb_log("heartbeat", HB_LOG_DEBUG, "Recv udp ip=%s:%d", inet_ntoa (addr.sin_addr), ntohs (addr.sin_port));
         memset(&recv_data, 0, sizeof(recv_data));
         memcpy(&recv_data, ipbuf, sizeof(recv_data));
 
@@ -513,7 +522,11 @@ void recv_udp_packet(int sockfd)
         }
 
         strcpy(ip, inet_ntoa(recv_data.src.sin_addr));
-        hb_log("heartbeat", HB_LOG_INFO, "Recv success, src=%s:%d", ip, ntohs(recv_data.src.sin_port));
+        hb_log("heartbeat", HB_LOG_INFO, "Recv success, src=%s:%d,"
+		                                 "flag=%s,index=%d,version=%s,length=%d",
+										  ip, ntohs(recv_data.src.sin_port),
+										  recv_data.packet_flag, recv_data.packet_index,
+										  recv_data.packet_version, recv_data.packet_length);
     }
 }
 
@@ -560,9 +573,9 @@ void *check_heartbeat_timeout(void *data)
                 if (entry->recv_packet == RECV_PACKET_INIT || entry->recv_packet == RECV_PACKET_RECONFIG) {
                     elapse_time_us = timediff (now, entry->tv_recv);
                     if (elapse_time_us > tolerate_timeout_us) {
-                        entry->disconnect = 1;
+                        //entry->disconnect = 1;
                         if (entry->hb_callback) {
-                            entry->hb_callback(&entry->dst, &entry->src);
+                            entry->hb_callback(&entry->dst, &entry->src, entry->msg);
                         }
                         hb_log ("heartbeat", HB_LOG_WARNING, "Not recv any packet from ip=%s:%d in last %d seconds!",
                                 inet_ntoa(entry->dst.sin_addr), ntohs(entry->dst.sin_port), elapse_time_us/1000000);
@@ -572,7 +585,7 @@ void *check_heartbeat_timeout(void *data)
                     if (diff >= entry->timeout) {
                         entry->disconnect = 1;
                         if (entry->hb_callback) {
-                            entry->hb_callback(&entry->dst, &entry->src);
+                            entry->hb_callback(&entry->dst, &entry->src, entry->msg);
                         }
                         hb_log ("heartbeat", HB_LOG_WARNING, "timeout!nowtime=%lu,recvtime=%lu,diff=%lu,"
                                                          "from ip=%s:%d",
@@ -658,7 +671,7 @@ void *recv_udp_message(void *data)
 }
 
 int
-reconfigure_heartbeat_info(int interval, int timeout)
+reconfigure_heartbeat_info(unsigned int interval, unsigned int timeout)
 {
     int ret = -1;
 
@@ -761,8 +774,8 @@ out:
 
 
 int
-register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
-                        unsigned int interval, unsigned int timeout, heartbeat_callback callback)
+register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa, unsigned int interval,
+                        unsigned int timeout, heartbeat_callback callback, void *msg)
 {
     struct sockaddr_in *src = NULL;
     struct sockaddr_in *dst = NULL;
@@ -836,6 +849,7 @@ register_heartbeat_info(struct sockaddr_in *ssa, struct sockaddr_in *dsa,
     entry->recv_packet = RECV_PACKET_INIT; //init 0 indicate not recevied any packet yet
     entry->disconnect = 0;
     entry->hb_callback = callback;
+	entry->msg = msg;
 
     pthread_mutex_lock(&heartbeat->ping_table_mtx);
     list_add_tail(&entry->list, &heartbeat->ping_table);
@@ -960,17 +974,21 @@ out:
 }
 
 void
-hb_callback_test (struct sockaddr_in *src, struct sockaddr_in *dst)
+hb_callback_test (struct sockaddr_in *src, struct sockaddr_in *dst, void *msg)
 {
 
     char src_addr[20] = {0};
     char dst_addr[20] = {0};
+	struct ping_packet *data = NULL;
+
+	data = (struct ping_packet *)msg;
 
     strcpy(src_addr, inet_ntoa(src->sin_addr));
     strcpy(dst_addr, inet_ntoa(dst->sin_addr));
-    hb_log ("heartbeat", HB_LOG_INFO, "src=%s:%d,dst=%s:%d has disconnect",
+    hb_log ("heartbeat", HB_LOG_INFO, "src=%s:%d,dst=%s:%d has disconnect"
+	                   "flag=%s",
                        src_addr, ntohs(src->sin_port),
-                       dst_addr, ntohs(dst->sin_port) );
+                       dst_addr, ntohs(dst->sin_port),data->packet_flag );
 }
 
 #if 0
@@ -986,6 +1004,10 @@ int main(int argc,char *argv[])
     struct sockaddr_in client_addr3 = {0};
     struct sockaddr_in server_addr3 = {0};
     int sockfd = 0;
+    struct ping_packet send_data = {0}; //64 bytes
+	//send_data.src = client_addr;
+	//send_data.dst = server_addr;
+	strcpy(send_data.packet_flag, "hello zj");
 
     bzero(&client_addr, sizeof(client_addr));
     client_addr.sin_family = AF_INET;
@@ -1028,7 +1050,7 @@ int main(int argc,char *argv[])
     server_addr3.sin_port = htons(8003);
 
     ret = heartbeat_init();
-    ret = register_heartbeat_info(&client_addr, &server_addr, 100, 800, hb_callback_test);
+    ret = register_heartbeat_info(&client_addr, &server_addr, 100, 800, hb_callback_test, &send_data);
     //ret = register_heartbeat_info(&client_addr1, &server_addr1, 100, 800, hb_callback_test);
     //ret = register_heartbeat_info(&client_addr2, &server_addr2, 100, 800, hb_callback_test);
     //ret = register_heartbeat_info(&client_addr3, &server_addr3, 100, 800);

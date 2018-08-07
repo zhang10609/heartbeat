@@ -11,13 +11,13 @@ LIBPATH  = .libs/
 vpath %.h ./inc
 
 OBJS     = heartbeat.o
-SRCS     = heartbeat.c list.h
+SRCS     = heartbeat.c heartbeat.h list.h
 
 $(OBJS):$(SRCS)
 	@$(CC) $(CFLAGS) $(INCLUDE) -c $^
 
 all:$(OBJS)
-	@$(CC) -shared -fPIC -o $(TARGET) $(OBJS)
+	@$(CC) -shared -fPIC -o $(TARGET) $(OBJS) -lpthread
 	@if [ ! -d $(LIBPATH) ]; then mkdir -p $(LIBPATH);fi;
 	@mv $(TARGET) $(LIBPATH)
 
